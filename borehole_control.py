@@ -23,6 +23,8 @@ borehole_wait_time = 15 #seconds. Time between turning the borehole pump on and 
 borehole_rest_time = 1800 #seconds => 30min
 borehole_max_pump_time=300 #seconds => 5min
 
+borehole_flow_rate = 0.5833 #l/sec (estimated)
+
 start_time=0
 
 #booster
@@ -64,7 +66,7 @@ def closeConnection(connection):
 		except Exception as error:
 			errorLog("Error trying to close db connection: "+str(error))
 
-def writeLog(log_code, pump_time, pump_volume, log_message):
+def writeLog(log_code, pump_time, pump_volume, log_message, pump):
 	connection = getConnection()
 #	+--------------------------+--------------+------+-----+------------------+----------------+
 #	| Field                    | Type         | Null | Key | Default          | Extra          |
@@ -87,6 +89,8 @@ def writeLog(log_code, pump_time, pump_volume, log_message):
 		insert_log+=", borehole_log_pump_time"
 		value_placeholders+=",%s"
 		values_list.append(pump_time)
+		if(pump==1): #borehole pump
+			pump_volume = round(pump_time*borehole_flow_rate)
 	if(pump_volume!=None):
 		insert_log+=", borehole_log_pump_volume"
 		value_placeholders+=",%s"
@@ -95,6 +99,10 @@ def writeLog(log_code, pump_time, pump_volume, log_message):
 		insert_log+=", borehole_log_message"
 		value_placeholders+=",%s"
 		values_list.append(log_message)
+	if(pump>0):
+		insert_log+=", borehole_log_pump"
+		value_placeholders+=",%s"
+		values_list.append(pump)
 	value_placeholders+=")"
 	insert_log+=value_placeholders
 
@@ -118,11 +126,11 @@ def writeLog(log_code, pump_time, pump_volume, log_message):
 def tank_full(flowing):
 	global start_time
 	gpio.output(pump, False)
-	writeLog(4,None, None, "Main tank full") #,"Main Tank Full: "+full_time+"\n\n")
+	writeLog(4,None, None, "Main tank full",0) #,"Main Tank Full: "+full_time+"\n\n")
 	if (flowing):
 			stop_time=time.time()
 			time_pumping = round(stop_time-start_time)
-			writeLog(3,time_pumping, None,"Pumped for "+str(time_pumping)+" seconds")
+			writeLog(3,time_pumping, None,"Pumped for "+str(time_pumping)+" seconds",1)
 	full_time = subprocess.check_output(bash_date.split())[:-1];
 	print("Main tank full") #debug**
 	while not gpio.input(float_switch):
@@ -136,7 +144,7 @@ def start_pump():
 	pumping=True
 	start_time=time.time()
 	pump_time = subprocess.check_output(bash_date.split())[:-1];
-	writeLog(2, None, None, "Started pumping at "+pump_time)
+	writeLog(2, None, None, "Started pumping at "+pump_time,1)
 	print("Pumping") #debug**
 	time.sleep(borehole_wait_time)
 
@@ -147,7 +155,7 @@ def stop_pump():
 	gpio.output(pump, False)
 	stop_time=time.time()
 	time_pumping = round(stop_time-start_time)
-	writeLog(3,time_pumping, None, "Pumped for "+str(time_pumping)+" seconds")
+	writeLog(3,time_pumping, None, "Pumped for "+str(time_pumping)+" seconds",1)
 	print("Stopped pumping") #debug**
 
 
@@ -175,9 +183,9 @@ def boosterPumpThread(thread_name, delay):
 			rest_time = booster_start_time-booster_stop_time;
 			if(rest_time<booster_min_rest_time):
 				print "Booster rest time is less than "+str(booster_min_rest_time)+" sec"
-				writeLog(22, None, None,"Booster rest time is less than "+str(booster_min_rest_time)+"sec!");
+				writeLog(22, None, None,"Booster rest time is less than "+str(booster_min_rest_time)+"sec!",2);
 
-			writeLog(5, None, None, None) #Booster pump started.
+			writeLog(5, None, None, None,2) #Booster pump started.
 			print "Booster pump started" ##debug**
 			booster_pumping=True
 		elif(gpio.input(booster_switch)==0 and booster_pumping==True):
@@ -188,7 +196,7 @@ def boosterPumpThread(thread_name, delay):
 			total_volume+=volume
 			#Record pumping time and estimated volume.
 			print "Booster pump stopped, pumped for ",str(elapsed_time)," volume=",str(volume) ##debug**
-			writeLog(6, elapsed_time, volume, "Pumped for "+str(elapsed_time)+", Volume="+str(volume))
+			writeLog(6, elapsed_time, volume, "Pumped for "+str(elapsed_time)+", Volume="+str(volume),2)
 			#booster_log.write("\n Total volume since "+control_start_time+" ="+str(total_volume))
 
 			#Booster pump has stopped running continuously so update flag.
@@ -204,7 +212,7 @@ def boosterPumpThread(thread_name, delay):
 			if(booster_run_time>booster_max_run_time and booster_continuous_alert_sent!=True):
 				booster_continuous_alert_sent=True
 #				booster_max_run_alert = open("/home/jannie/booster_max_run_time.txt","w")
-				writeLog(22,None, None, "Booster pump appears to be running continuously!")
+				writeLog(22,None, None, "Booster pump appears to be running continuously!",2)
 		time.sleep(0.1)
 
 
@@ -217,8 +225,10 @@ def run():
 	global flow_switch
 	global pumping
 
+	malfunction=False
+
 	time.sleep(5)
-	writeLog(1,None, None,"Device restarted")
+	writeLog(1,None, None,"Device restarted",0)
 
 	#booster
 	thread.start_new_thread(boosterPumpThread, ("booster_thread1",0))
@@ -231,9 +241,14 @@ def run():
 			if not gpio.input(float_switch):
 				tank_full(False)
 				continue
-			if gpio.input(flow_switch):
-				writeLog(21, None, None, "Flow switch malfunction!")
-				return
+			if gpio.input(flow_switch): ##Flow switch is activated before pump has started, malfunction.
+				time.sleep(2)
+				if gpio.input(flow_switch):
+					if(gpio.input(pump)):
+                        			stop_pump()
+					malfunction=True
+					writeLog(21, None, None, "Flow switch malfunction!",0)
+					break
 			start_pump()
 #			print "run(): start_time="+str(start_time) #debug**
 			while(pumping):
@@ -251,12 +266,17 @@ def run():
 						stop_pump()
 						time.sleep(borehole_rest_time) #900)
 				elif(time.time()-start_time>=borehole_max_pump_time):
-					writeLog(21,None, None, "Borehole pump reached max pump time!")
-					return
+					malfunction=True
+					writeLog(21,None, None, "Borehole pump reached max pump time!",1)
+					break
+			if malfunction:
+				if(gpio.input(pump)):
+		                        stop_pump()
+				break
 	except Exception as error:
 		print "Something broke! Check borehole now! Error => "+str(error)
 		errorLog("Something broke! Check borehole now! Error => "+str(error))
-		writeLog(21, None, None, "Something broke! Check borehole now!")
+		writeLog(21, None, None, "Something broke! Check borehole now!",1)
 	except:
 		errorLog("Something really unknown broke")
 	finally:
